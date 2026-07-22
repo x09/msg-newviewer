@@ -1,0 +1,1787 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+MSG NewViewer — просмотрщик файлов электронной почты Microsoft Outlook (.msg)
+
+для Linux на python3 + tkinter.
+
+Реализация основана на открытых спецификациях Microsoft:
+  [MS-CFB]    — Compound File Binary File Format (OLE-хранилище,
+                заголовок, сектора FAT/DIFAT/MiniFAT, каталог);
+  [MS-OXMSG]  — Outlook Item (.msg) File Format (потоки __substg1.0_XXXXTTTT,
+                __properties_version1.0, хранилища __recip_version1.0_#N,
+                __attach_version1.0_#N, вложенные письма 3701000D);
+  [MS-OXPROPS]— каталог тегов и типов данных MAPI.
+
+Использует только стандартную библиотеку Python (без внешних зависимостей).
+
+Запуск:  ./msg_newviewer --help
+         
+"""
+
+import os
+import re
+import struct
+import sys
+import html.parser
+from datetime import datetime, timedelta, timezone
+
+# ---------------------------------------------------------------------------
+#  Часть 1. Парсер OLE-хранилища (Compound File Binary) по [MS-CFB]
+# ---------------------------------------------------------------------------
+
+CFB_SIGNATURE = b"\xd0\xcf\x11\xe0\xa1\xb1\x1a\xe1"
+
+MAXREGSECT = 0xFFFFFFFA
+DIFSECT    = 0xFFFFFFFC   # сектор занят DIFAT
+FATSECT    = 0xFFFFFFFD   # сектор занят FAT
+ENDOFCHAIN = 0xFFFFFFFE   # конец цепочки секторов
+FREESECT   = 0xFFFFFFFF   # свободный сектор
+NOSTREAM   = 0xFFFFFFFF   # "нет узла" в дереве каталога
+
+OBJ_UNKNOWN = 0x00
+OBJ_STORAGE = 0x01
+OBJ_STREAM  = 0x02
+OBJ_ROOT    = 0x05
+
+
+class CFBError(Exception):
+    """Ошибка разбора файла CFB/OLE."""
+
+
+class DirEntry:
+    """Запись каталога CFB ([MS-CFB] 2.6.1) — 128 байт."""
+
+    __slots__ = ("name", "obj_type", "color", "left", "right", "child",
+                 "clsid", "state", "start_sector", "size", "children", "index")
+
+    def __init__(self, raw, index):
+        (name_raw, name_len, self.obj_type, self.color,
+         self.left, self.right, self.child, self.clsid, self.state,
+         _ctime, _mtime, self.start_sector, self.size) = struct.unpack(
+            "<64sHBBIII16sI8s8sIQ", raw)
+        self.index = index
+        if 0 < name_len <= 64:
+            self.name = name_raw[:name_len - 2].decode("utf-16-le", "replace")
+        else:
+            self.name = ""
+        self.children = []
+
+    def __repr__(self):
+        return "<DirEntry %r type=%d size=%d>" % (self.name, self.obj_type, self.size)
+
+
+class CompoundFile:
+    """Чтение OLE compound file: заголовок, DIFAT, FAT, MiniFAT, каталог."""
+
+    def __init__(self, data):
+        self.data = data
+        if len(data) < 512 or data[:8] != CFB_SIGNATURE:
+            raise CFBError("Файл не является OLE compound file "
+                           "(отсутствует сигнатура D0 CF 11 E0 A1 B1 1A E1)")
+
+        (minor, major, byte_order, sector_shift, mini_shift) = struct.unpack_from(
+            "<HHHHH", data, 24)
+        if byte_order != 0xFFFE:
+            raise CFBError("Неверный порядок байтов в заголовке CFB")
+        if major not in (3, 4) or sector_shift not in (9, 12):
+            raise CFBError("Неподдерживаемая версия CFB: major=%d shift=%d"
+                           % (major, sector_shift))
+
+        self.sector_size = 1 << sector_shift              # 512 или 4096
+        self.mini_sector_size = 1 << mini_shift           # обычно 64
+        (self.num_dir_sectors, self.num_fat_sectors, self.first_dir_sector,
+         _trans, self.mini_cutoff, self.first_minifat_sector,
+         self.num_minifat_sectors, self.first_difat_sector,
+         self.num_difat_sectors) = struct.unpack_from("<9I", data, 40)
+
+        self._load_difat()
+        self._load_fat()
+        self._load_directory()
+        self._load_minifat()
+
+    # -- секторы -----------------------------------------------------------
+
+    def _sector(self, sid):
+        """Байты обычного сектора: смещение = (sid + 1) << sector_shift."""
+        off = (sid + 1) * self.sector_size
+        if off + self.sector_size > len(self.data):
+            # усечённый файл — возвращаем то, что есть, дополняя нулями
+            chunk = self.data[off:off + self.sector_size]
+            return chunk + b"\x00" * (self.sector_size - len(chunk))
+        return self.data[off:off + self.sector_size]
+
+    def _load_difat(self):
+        """DIFAT: 109 записей в заголовке + цепочка DIFAT-секторов."""
+        self.difat = list(struct.unpack_from("<109I", self.data, 76))
+        per_sector = self.sector_size // 4 - 1
+        sid = self.first_difat_sector
+        seen = set()
+        while sid not in (ENDOFCHAIN, FREESECT) and sid <= MAXREGSECT:
+            if sid in seen:
+                raise CFBError("Цикл в цепочке DIFAT")
+            seen.add(sid)
+            sec = self._sector(sid)
+            entries = struct.unpack("<%dI" % (self.sector_size // 4), sec)
+            self.difat.extend(entries[:per_sector])
+            sid = entries[per_sector]
+        self.difat = [s for s in self.difat if s != FREESECT]
+
+    def _load_fat(self):
+        """FAT собирается из секторов, перечисленных в DIFAT."""
+        n = self.sector_size // 4
+        fat = []
+        for sid in self.difat:
+            fat.extend(struct.unpack("<%dI" % n, self._sector(sid)))
+        self.fat = fat
+
+    def _chain(self, start, fat):
+        """Цепочка номеров секторов, начиная со start, с защитой от циклов."""
+        chain, seen = [], set()
+        sid = start
+        while sid not in (ENDOFCHAIN, FREESECT) and sid <= MAXREGSECT:
+            if sid in seen or sid >= len(fat):
+                break  # повреждённая цепочка — читаем, что успели
+            seen.add(sid)
+            chain.append(sid)
+            sid = fat[sid]
+        return chain
+
+    def _read_chain(self, start, size=None):
+        """Читает поток по цепочке в FAT."""
+        parts = [self._sector(sid) for sid in self._chain(start, self.fat)]
+        blob = b"".join(parts)
+        return blob if size is None else blob[:size]
+
+    def _load_minifat(self):
+        """MiniFAT и mini-stream (данные корневой записи)."""
+        blob = self._read_chain(self.first_minifat_sector)
+        self.minifat = list(struct.unpack("<%dI" % (len(blob) // 4), blob)) if blob else []
+        root = self.root
+        self.mini_stream = self._read_chain(root.start_sector, root.size) if root else b""
+
+    def _read_mini_chain(self, start, size):
+        parts = []
+        for sid in self._chain(start, self.minifat):
+            off = sid * self.mini_sector_size
+            parts.append(self.mini_stream[off:off + self.mini_sector_size])
+        return b"".join(parts)[:size]
+
+    # -- каталог -----------------------------------------------------------
+
+    def _load_directory(self):
+        blob = self._read_chain(self.first_dir_sector)
+        self.entries = []
+        for i in range(len(blob) // 128):
+            e = DirEntry(blob[i * 128:(i + 1) * 128], i)
+            self.entries.append(e)
+        self.root = None
+        for e in self.entries:
+            if e.obj_type == OBJ_ROOT:
+                self.root = e
+                break
+        if self.root is None:
+            raise CFBError("Не найдена корневая запись каталога (Root Entry)")
+        self._link_children(self.root)
+
+    def _link_children(self, storage):
+        """Обход красно-чёрного дерева детей хранилища (left/right/child)."""
+        result, stack, seen = [], [], set()
+        node = storage.child
+        while True:
+            while node != NOSTREAM and node < len(self.entries) and node not in seen:
+                seen.add(node)
+                stack.append(node)
+                node = self.entries[node].left
+            if not stack:
+                break
+            idx = stack.pop()
+            entry = self.entries[idx]
+            if entry.obj_type in (OBJ_STORAGE, OBJ_STREAM):
+                result.append(entry)
+            node = entry.right
+        storage.children = result
+        for e in result:
+            if e.obj_type == OBJ_STORAGE:
+                self._link_children(e)
+
+    # -- публичный интерфейс ----------------------------------------------
+
+    def read_stream(self, entry):
+        """Содержимое потока: mini-stream для мелких, FAT — для крупных."""
+        if entry.obj_type == OBJ_ROOT:
+            return self.mini_stream
+        if entry.size < self.mini_cutoff:
+            return self._read_mini_chain(entry.start_sector, entry.size)
+        return self._read_chain(entry.start_sector, entry.size)
+
+
+# ---------------------------------------------------------------------------
+#  Часть 2. Разбор MSG (MAPI-свойства) по [MS-OXMSG] / [MS-OXPROPS]
+# ---------------------------------------------------------------------------
+
+# Типы свойств MAPI ([MS-OXCDATA] 2.11.1)
+PT_SHORT    = 0x0002
+PT_LONG     = 0x0003
+PT_FLOAT    = 0x0004
+PT_DOUBLE   = 0x0005
+PT_BOOLEAN  = 0x000B
+PT_OBJECT   = 0x000D
+PT_LONGLONG = 0x0014
+PT_STRING8  = 0x001E
+PT_UNICODE  = 0x001F
+PT_SYSTIME  = 0x0040
+PT_CLSID    = 0x0048
+PT_BINARY   = 0x0102
+
+# Идентификаторы свойств ([MS-OXPROPS])
+PR_SUBJECT              = 0x0037
+PR_CLIENT_SUBMIT_TIME   = 0x0039
+PR_SENDER_NAME          = 0x0C1A
+PR_SENDER_EMAIL         = 0x0C1F
+PR_SENT_REPR_NAME       = 0x0042
+PR_SENT_REPR_EMAIL      = 0x0065
+PR_DISPLAY_TO           = 0x0E04
+PR_DISPLAY_CC           = 0x0E03
+PR_MESSAGE_DELIVERY_TIME= 0x0E06
+PR_BODY                 = 0x1000
+PR_RTF_COMPRESSED       = 0x1009
+PR_HTML                 = 0x1013
+PR_INTERNET_CPID        = 0x3FDE
+PR_MESSAGE_CODEPAGE     = 0x3FFD
+PR_STORE_SUPPORT_MASK   = 0x340D
+PR_DISPLAY_NAME         = 0x3001
+PR_EMAIL_ADDRESS        = 0x3003
+PR_SMTP_ADDRESS         = 0x39FE
+PR_RECIPIENT_TYPE       = 0x0C15
+PR_ATTACH_DATA          = 0x3701
+PR_ATTACH_FILENAME      = 0x3704
+PR_ATTACH_METHOD        = 0x3705
+PR_ATTACH_LONG_FILENAME = 0x3707
+PR_ATTACH_MIME_TAG      = 0x370E
+PR_ATTACH_CONTENT_ID    = 0x3712
+PR_ATTACHMENT_HIDDEN    = 0x7FFE
+
+ATTACH_BY_VALUE   = 0x01
+ATTACH_EMBED_MSG  = 0x05
+ATTACH_OLE        = 0x06
+
+PROPERTIES_STREAM = "__properties_version1.0"
+SUBSTG_PREFIX     = "__substg1.0_"
+RECIP_PREFIX      = "__recip_version1.0_#"
+ATTACH_PREFIX     = "__attach_version1.0_#"
+NAMEID_STORAGE    = "__nameid_version1.0"
+EMBED_MSG_STREAM  = "__substg1.0_3701000D"
+
+_FILETIME_EPOCH = datetime(1601, 1, 1, tzinfo=timezone.utc)
+
+
+def filetime_to_datetime(ft):
+    """FILETIME (100-нс интервалы с 01.01.1601 UTC) -> datetime."""
+    if not ft:
+        return None
+    try:
+        return _FILETIME_EPOCH + timedelta(microseconds=ft // 10)
+    except OverflowError:
+        return None
+
+
+def codepage_to_codec(cp):
+    """Windows code page -> имя кодека Python."""
+    known = {
+        1200: "utf-16-le", 1201: "utf-16-be", 65001: "utf-8", 65000: "utf-7",
+        1251: "cp1251", 1252: "cp1252", 1250: "cp1250", 1253: "cp1253",
+        1254: "cp1254", 1255: "cp1255", 1256: "cp1256", 1257: "cp1257",
+        1258: "cp1258", 866: "cp866", 855: "cp855", 20866: "koi8-r",
+        21866: "koi8-u", 28595: "iso8859-5", 28591: "latin-1",
+        936: "gbk", 932: "cp932", 949: "cp949", 950: "cp950",
+        54936: "gb18030", 20127: "ascii",
+    }
+    if cp in known:
+        return known[cp]
+    try:
+        import codecs
+        codecs.lookup("cp%d" % cp)
+        return "cp%d" % cp
+    except (LookupError, ValueError):
+        return "cp1252"
+
+
+class PropertySet:
+    """Свойства одного объекта MSG (сообщение / получатель / вложение).
+
+    Собираются из потока __properties_version1.0 (значения фиксированной
+    длины) и потоков __substg1.0_XXXXTTTT (значения переменной длины).
+    Ключ словаря — идентификатор свойства (старшие 16 бит тега).
+    """
+
+    def __init__(self, cfb, storage, header_size):
+        self.cfb = cfb
+        self.storage = storage
+        self.props = {}       # id -> (type, value)
+        self._load_substreams()
+        self._load_fixed(header_size)
+
+    # -- потоки переменной длины ------------------------------------------
+
+    def _load_substreams(self):
+        for e in self.storage.children:
+            if e.obj_type != OBJ_STREAM or not e.name.startswith(SUBSTG_PREFIX):
+                continue
+            tag_hex = e.name[len(SUBSTG_PREFIX):]
+            if len(tag_hex) < 8:
+                continue
+            try:
+                prop_id = int(tag_hex[0:4], 16)
+                prop_type = int(tag_hex[4:8], 16)
+            except ValueError:
+                continue
+            if prop_type & 0x1000:      # multi-valued — не нужны для просмотра
+                continue
+            raw = self.cfb.read_stream(e)
+            self.props[prop_id] = (prop_type, raw)
+
+    # -- поток __properties_version1.0 ------------------------------------
+
+    def _load_fixed(self, header_size):
+        stream = None
+        for e in self.storage.children:
+            if e.obj_type == OBJ_STREAM and e.name == PROPERTIES_STREAM:
+                stream = self.cfb.read_stream(e)
+                break
+        self.prop_header = stream[:header_size] if stream else b""
+        if not stream:
+            return
+        for off in range(header_size, len(stream) - 15, 16):
+            tag, _flags = struct.unpack_from("<II", stream, off)
+            prop_type = tag & 0xFFFF
+            prop_id = tag >> 16
+            value = stream[off + 8:off + 16]
+            if prop_id in self.props:
+                continue  # значение уже прочитано из substg-потока
+            if prop_type == PT_LONG:
+                self.props[prop_id] = (prop_type, struct.unpack("<i", value[:4])[0])
+            elif prop_type == PT_SHORT:
+                self.props[prop_id] = (prop_type, struct.unpack("<h", value[:2])[0])
+            elif prop_type == PT_BOOLEAN:
+                self.props[prop_id] = (prop_type, value[0] != 0)
+            elif prop_type == PT_LONGLONG:
+                self.props[prop_id] = (prop_type, struct.unpack("<q", value)[0])
+            elif prop_type == PT_SYSTIME:
+                self.props[prop_id] = (prop_type, struct.unpack("<Q", value)[0])
+            elif prop_type == PT_FLOAT:
+                self.props[prop_id] = (prop_type, struct.unpack("<f", value[:4])[0])
+            elif prop_type == PT_DOUBLE:
+                self.props[prop_id] = (prop_type, struct.unpack("<d", value)[0])
+
+    # -- доступ к значениям -----------------------------------------------
+
+    def raw(self, prop_id, default=None):
+        item = self.props.get(prop_id)
+        return item[1] if item else default
+
+    def get_int(self, prop_id, default=None):
+        item = self.props.get(prop_id)
+        if item and isinstance(item[1], (int, bool)):
+            return int(item[1])
+        return default
+
+    def get_bytes(self, prop_id):
+        item = self.props.get(prop_id)
+        if item and isinstance(item[1], bytes):
+            return item[1]
+        return None
+
+    def get_str(self, prop_id, codepage=1252):
+        item = self.props.get(prop_id)
+        if not item:
+            return None
+        prop_type, value = item
+        if isinstance(value, str):
+            return value
+        if not isinstance(value, bytes):
+            return None
+        if prop_type == PT_UNICODE:
+            return value.decode("utf-16-le", "replace").rstrip("\x00")
+        if prop_type == PT_STRING8:
+            return value.decode(codepage_to_codec(codepage), "replace").rstrip("\x00")
+        return None
+
+    def get_time(self, prop_id):
+        item = self.props.get(prop_id)
+        if item and item[0] == PT_SYSTIME:
+            return filetime_to_datetime(item[1])
+        return None
+
+
+# ---------------------------------------------------------------------------
+#  Часть 3. Декомпрессия RTF (LZFu) и преобразование HTML/RTF в текст
+# ---------------------------------------------------------------------------
+
+_LZFU_DICT = (
+    b"{\\rtf1\\ansi\\mac\\deff0\\deftab720{\\fonttbl;}{\\f0\\fnil \\froman "
+    b"\\fswiss \\fmodern \\fscript \\fdecor MS Sans SerifSymbolArialTimes "
+    b"New RomanCourier{\\colortbl\\red0\\green0\\blue0\r\n\\par "
+    b"\\pard\\plain\\f0\\fs20\\b\\i\\u\\tab\\tx"
+)
+LZFU_COMPRESSED   = 0x75465A4C  # "LZFu"
+LZFU_UNCOMPRESSED = 0x414C454D  # "MELA"
+
+
+def decompress_rtf(data):
+    """Распаковка PidTagRtfCompressed ([MS-OXRTFCP], алгоритм LZFu)."""
+    if len(data) < 16:
+        return b""
+    _comp_size, raw_size, magic, _crc = struct.unpack_from("<IIII", data, 0)
+    if magic == LZFU_UNCOMPRESSED:
+        return data[16:16 + raw_size]
+    if magic != LZFU_COMPRESSED:
+        return b""
+
+    dictionary = bytearray(4096)
+    dictionary[:len(_LZFU_DICT)] = _LZFU_DICT
+    wpos = len(_LZFU_DICT)
+    out = bytearray()
+    pos = 16
+    end = len(data)
+    try:
+        while pos < end and len(out) < raw_size:
+            control = data[pos]; pos += 1
+            for bit in range(8):
+                if pos >= end or len(out) >= raw_size:
+                    break
+                if control & (1 << bit):            # ссылка (offset, length)
+                    ref = (data[pos] << 8) | data[pos + 1]
+                    pos += 2
+                    offset = ref >> 4
+                    length = (ref & 0x0F) + 2
+                    if offset == (wpos & 0xFFF):    # маркер конца
+                        return bytes(out[:raw_size])
+                    for i in range(length):
+                        ch = dictionary[(offset + i) & 0xFFF]
+                        out.append(ch)
+                        dictionary[wpos & 0xFFF] = ch
+                        wpos += 1
+                else:                               # литеральный байт
+                    ch = data[pos]; pos += 1
+                    out.append(ch)
+                    dictionary[wpos & 0xFFF] = ch
+                    wpos += 1
+    except IndexError:
+        pass
+    return bytes(out[:raw_size])
+
+
+class _HTMLToText(html.parser.HTMLParser):
+    """Извлечение видимого текста из HTML средствами стандартной библиотеки."""
+
+    _BLOCK = {"p", "div", "br", "tr", "li", "h1", "h2", "h3", "h4", "h5",
+              "h6", "table", "ul", "ol", "blockquote", "pre", "hr"}
+    # только элементы с закрывающим тегом: пустые (meta, link…) сюда нельзя,
+    # иначе счётчик пропуска никогда не обнулится
+    _SKIP = {"script", "style", "title", "xml"}
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts = []
+        self._skip_depth = 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip_depth += 1
+        elif tag in self._BLOCK:
+            self.parts.append("\n")
+        elif tag == "td":
+            self.parts.append("\t")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self._skip_depth:
+            self._skip_depth -= 1
+        elif tag in ("p", "div", "tr", "table", "ul", "ol", "blockquote"):
+            self.parts.append("\n")
+
+    def handle_data(self, data):
+        if not self._skip_depth:
+            self.parts.append(data)
+
+    def text(self):
+        txt = "".join(self.parts)
+        txt = re.sub(r"[ \t]+\n", "\n", txt)
+        txt = re.sub(r"\n{3,}", "\n\n", txt)
+        return txt.strip("\n")
+
+
+def html_to_text(markup):
+    parser = _HTMLToText()
+    try:
+        parser.feed(markup)
+        parser.close()
+    except Exception:
+        pass
+    return parser.text()
+
+
+_RTF_DESTINATIONS = {
+    "fonttbl", "colortbl", "stylesheet", "info", "pict", "themedata",
+    "colorschememapping", "datastore", "latentstyles", "listtable",
+    "listoverridetable", "rsidtbl", "generator", "xmlnstbl", "objdata",
+    "fldinst", "blipuid", "panose",
+}
+
+
+def rtf_to_text(rtf_bytes, default_codepage=1252, want_html=False):
+    """Преобразование RTF в текст (или де-инкапсуляция HTML).
+
+    Если want_html=True и RTF является инкапсулированным HTML ([MS-OXRTFEX]),
+    возвращается восстановленный HTML-markup; иначе (обычный RTF) — None.
+    При want_html=False всегда возвращается обычный текст.
+    """
+    try:
+        rtf = rtf_bytes.decode("latin-1", "replace")
+    except Exception:
+        return None if want_html else ""
+
+    from_html = "\\fromhtml" in rtf[:512]
+    if from_html:
+        # RTF-инкапсулированный HTML ([MS-OXRTFEX]): HTML лежит в группах
+        # \*\htmltag и в обычном тексте; фрагменты между \htmlrtf ... \htmlrtf0
+        # предназначены только для RTF-читалок и подавляются в токенизаторе.
+        rtf = re.sub(r"\{\\\*\\htmltag\d*\s?", "{", rtf)
+
+    out = []
+    i, n = 0, len(rtf)
+    skip_stack = []   # глубины групп-"назначений", содержимое которых прячем
+    depth = 0
+    codepage = default_codepage
+    uc_skip = 1
+    suppress = False  # текст между \htmlrtf ... \htmlrtf0 (только для RTF)
+    cp_bytes = bytearray()
+
+    def flush_cp():
+        if cp_bytes:
+            out.append(cp_bytes.decode(codepage_to_codec(codepage), "replace"))
+            cp_bytes.clear()
+
+    while i < n:
+        c = rtf[i]
+        if c == "{":
+            depth += 1
+            i += 1
+        elif c == "}":
+            flush_cp()
+            if skip_stack and skip_stack[-1] == depth:
+                skip_stack.pop()
+            depth -= 1
+            i += 1
+        elif c == "\\":
+            m = re.match(r"\\([a-zA-Z]+)(-?\d+)? ?", rtf[i:])
+            if m:
+                word, num = m.group(1), m.group(2)
+                i += m.end()
+                if word == "htmlrtf":
+                    suppress = (num != "0")
+                elif word in _RTF_DESTINATIONS:
+                    if depth not in skip_stack:
+                        skip_stack.append(depth)
+                elif skip_stack:
+                    pass
+                elif word == "ansicpg" and num:
+                    codepage = int(num)
+                elif word == "uc" and num:
+                    uc_skip = int(num)
+                elif suppress:
+                    pass
+                elif word == "u" and num:
+                    flush_cp()
+                    code = int(num)
+                    out.append(chr(code + 65536 if code < 0 else code))
+                    j, skipped = i, 0
+                    while j < n and skipped < uc_skip:
+                        if rtf[j] == "\\" and j + 3 < n and rtf[j + 1] == "'":
+                            j += 4
+                        else:
+                            j += 1
+                        skipped += 1
+                    i = j
+                elif word in ("par", "line", "sect", "page"):
+                    flush_cp()
+                    out.append("\n")
+                elif word == "tab":
+                    flush_cp()
+                    out.append("\t")
+                elif word in ("emdash", "endash"):
+                    flush_cp()
+                    out.append("—" if word == "emdash" else "–")
+                elif word in ("lquote", "rquote"):
+                    flush_cp()
+                    out.append("'")
+                elif word in ("ldblquote", "rdblquote"):
+                    flush_cp()
+                    out.append('"')
+                elif word == "bin" and num:
+                    i += int(num)
+            elif i + 3 < n and rtf[i + 1] == "'":
+                if not skip_stack and not suppress:
+                    try:
+                        cp_bytes.append(int(rtf[i + 2:i + 4], 16))
+                    except ValueError:
+                        pass
+                i += 4
+            elif i + 1 < n and rtf[i + 1] in "\\{}":
+                if not skip_stack and not suppress:
+                    flush_cp()
+                    out.append(rtf[i + 1])
+                i += 2
+            elif i + 1 < n and rtf[i + 1] == "*":
+                if depth not in skip_stack:
+                    skip_stack.append(depth)
+                i += 2
+            else:
+                i += 2
+        elif c in "\r\n":
+            i += 1
+        else:
+            if not skip_stack and not suppress:
+                if cp_bytes and ord(c) < 128:
+                    flush_cp()
+                if ord(c) < 128:
+                    out.append(c)
+                else:
+                    cp_bytes.append(ord(c) & 0xFF)
+            i += 1
+    flush_cp()
+    text = "".join(out)
+    if from_html:
+        if want_html:
+            return text            # де-инкапсулированный HTML-markup
+        text = html_to_text(text)
+    elif want_html:
+        return None                # обычный RTF — HTML-версии нет
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+
+# ---------------------------------------------------------------------------
+#  Часть 4. Модель сообщения: заголовки, тело, получатели, вложения
+# ---------------------------------------------------------------------------
+
+RECIPIENT_TYPES = {1: "to", 2: "cc", 3: "bcc"}
+
+
+class Attachment:
+    def __init__(self, index, props, codepage, cfb, storage):
+        self.index = index
+        self.props = props
+        self.method = props.get_int(PR_ATTACH_METHOD, ATTACH_BY_VALUE)
+        self.hidden = bool(props.get_int(PR_ATTACHMENT_HIDDEN, 0))
+        self.content_id = props.get_str(PR_ATTACH_CONTENT_ID, codepage)
+        self.mime = props.get_str(PR_ATTACH_MIME_TAG, codepage)
+        name = (props.get_str(PR_ATTACH_LONG_FILENAME, codepage)
+                or props.get_str(PR_ATTACH_FILENAME, codepage)
+                or props.get_str(PR_DISPLAY_NAME, codepage))
+        self.embedded_message = None
+        self.data = None
+
+        if self.method == ATTACH_EMBED_MSG:
+            for e in storage.children:
+                if e.obj_type == OBJ_STORAGE and e.name == EMBED_MSG_STREAM:
+                    self.embedded_message = Message(cfb, e, embedded=True)
+                    break
+            if not name and self.embedded_message:
+                name = self.embedded_message.subject or "Вложенное письмо"
+            if name and not name.lower().endswith(".msg"):
+                name += ".msg"
+        else:
+            self.data = props.get_bytes(PR_ATTACH_DATA)
+
+        self.name = name or ("attachment_%d.bin" % (index + 1))
+
+    @property
+    def size(self):
+        if self.data is not None:
+            return len(self.data)
+        if self.embedded_message is not None:
+            return self.embedded_message.estimated_size()
+        return 0
+
+    def save(self, path):
+        """Сохраняет вложение на диск в исходном (оригинальном) формате."""
+        if self.data is not None:
+            with open(path, "wb") as fh:
+                fh.write(self.data)
+            return True
+        if self.embedded_message is not None:
+            blob = self.embedded_message.to_msg_bytes()
+            with open(path, "wb") as fh:
+                fh.write(blob)
+            return True
+        return False
+
+    @property
+    def savable(self):
+        return self.data is not None or self.embedded_message is not None
+
+
+class Message:
+    """Сообщение (верхний уровень .msg или вложенное письмо)."""
+
+    def __init__(self, cfb, storage=None, embedded=False):
+        self.cfb = cfb
+        self.storage = storage or cfb.root
+        self.embedded = embedded
+        header_size = 24 if embedded else 32
+        self.props = PropertySet(cfb, self.storage, header_size)
+
+        self.codepage = (self.props.get_int(PR_INTERNET_CPID)
+                         or self.props.get_int(PR_MESSAGE_CODEPAGE)
+                         or 1252)
+
+        self.subject = self.props.get_str(PR_SUBJECT, self.codepage) or ""
+        self.sender_name = (self.props.get_str(PR_SENDER_NAME, self.codepage)
+                            or self.props.get_str(PR_SENT_REPR_NAME, self.codepage) or "")
+        self.sender_email = (self.props.get_str(PR_SENDER_EMAIL, self.codepage)
+                             or self.props.get_str(PR_SENT_REPR_EMAIL, self.codepage) or "")
+        self.date = (self.props.get_time(PR_CLIENT_SUBMIT_TIME)
+                     or self.props.get_time(PR_MESSAGE_DELIVERY_TIME))
+
+        self._load_recipients()
+        self._load_attachments()
+        self.body_text, self.body_html = self._resolve_bodies()
+        self.body = self.body_text        # обратная совместимость
+
+    # -- получатели --------------------------------------------------------
+
+    def _load_recipients(self):
+        self.recipients = {"to": [], "cc": [], "bcc": []}
+        for e in sorted(self.storage.children, key=lambda x: x.name):
+            if e.obj_type != OBJ_STORAGE or not e.name.startswith(RECIP_PREFIX):
+                continue
+            props = PropertySet(self.cfb, e, 8)
+            name = props.get_str(PR_DISPLAY_NAME, self.codepage) or ""
+            email = (props.get_str(PR_SMTP_ADDRESS, self.codepage)
+                     or props.get_str(PR_EMAIL_ADDRESS, self.codepage) or "")
+            rtype = RECIPIENT_TYPES.get(props.get_int(PR_RECIPIENT_TYPE, 1), "to")
+            if email and email.lower() != name.lower():
+                display = "%s <%s>" % (name, email) if name else email
+            else:
+                display = name or email
+            if display:
+                self.recipients[rtype].append(display)
+
+    def display_to(self):
+        return (self.props.get_str(PR_DISPLAY_TO, self.codepage)
+                or "; ".join(self.recipients["to"]))
+
+    def display_cc(self):
+        return (self.props.get_str(PR_DISPLAY_CC, self.codepage)
+                or "; ".join(self.recipients["cc"]))
+
+    def sender_display(self):
+        n, e = self.sender_name, self.sender_email
+        if n and e and n.lower() != e.lower():
+            return "%s <%s>" % (n, e)
+        return n or e
+
+    # -- вложения ----------------------------------------------------------
+
+    def _load_attachments(self):
+        self.attachments = []
+        storages = sorted(
+            (e for e in self.storage.children
+             if e.obj_type == OBJ_STORAGE and e.name.startswith(ATTACH_PREFIX)),
+            key=lambda x: x.name)
+        for i, e in enumerate(storages):
+            try:
+                props = PropertySet(self.cfb, e, 8)
+                self.attachments.append(
+                    Attachment(i, props, self.codepage, self.cfb, e))
+            except Exception:
+                continue
+
+    # -- тело письма -------------------------------------------------------
+
+    def _decode_html(self, html_raw):
+        """PidTagHtml (байты) -> строка с учётом объявленной кодировки."""
+        codec = codepage_to_codec(self.codepage)
+        try:
+            markup = html_raw.decode(codec, "replace")
+        except Exception:
+            markup = html_raw.decode("latin-1", "replace")
+        m = re.search(rb"charset=[\"']?([\w\-]+)", html_raw[:2048], re.I)
+        if m:
+            try:
+                markup = html_raw.decode(m.group(1).decode("ascii"), "replace")
+            except (LookupError, UnicodeDecodeError):
+                pass
+        return markup
+
+    def _resolve_bodies(self):
+        """Возвращает (plain_text, html) по [MS-OXBBODY].
+
+        plain_text: PidTagBody, иначе текст из HTML, иначе текст из RTF.
+        html:       PidTagHtml, иначе HTML, де-инкапсулированный из RTF,
+                    иначе None (будет сгенерирован из текста при показе/экспорте).
+        """
+        text = self.props.get_str(PR_BODY, self.codepage) or ""
+        html_markup = None
+
+        html_raw = self.props.get_bytes(PR_HTML)
+        if html_raw:
+            html_markup = self._decode_html(html_raw)
+
+        rtf_raw = self.props.get_bytes(PR_RTF_COMPRESSED)
+        rtf = decompress_rtf(rtf_raw) if rtf_raw else b""
+
+        if html_markup is None and rtf:
+            html_markup = rtf_to_text(rtf, self.codepage, want_html=True)
+
+        if not text.strip():
+            if html_markup:
+                text = html_to_text(html_markup)
+            elif rtf:
+                text = rtf_to_text(rtf, self.codepage)
+
+        return text, html_markup
+
+    # -- сериализация вложенного письма обратно в .msg ---------------------
+
+    def estimated_size(self):
+        total = 0
+        stack = [self.storage]
+        while stack:
+            node = stack.pop()
+            for e in node.children:
+                if e.obj_type == OBJ_STREAM:
+                    total += e.size
+                elif e.obj_type == OBJ_STORAGE:
+                    stack.append(e)
+        return total
+
+    def to_msg_bytes(self):
+        """Собирает автономный .msg (CFB-файл) из хранилища вложенного письма.
+
+        Заголовок потока свойств верхнего уровня — 32 байта, у вложенного —
+        24 ([MS-OXMSG] 2.4.1), поэтому при извлечении дополняем его.
+        """
+        writer = CFBWriter()
+
+        def copy(src, dst_path):
+            for e in src.children:
+                path = dst_path + [e.name]
+                if e.obj_type == OBJ_STREAM:
+                    data = self.cfb.read_stream(e)
+                    if e.name == PROPERTIES_STREAM and len(dst_path) == 0:
+                        # 24-байтовый заголовок -> 32-байтовый (top level)
+                        data = data[:24] + b"\x00" * 8 + data[24:]
+                    writer.add_stream(path, data)
+                elif e.obj_type == OBJ_STORAGE:
+                    writer.add_storage(path, e.clsid)
+                    copy(e, path)
+
+        writer.root_clsid = self.storage.clsid
+        copy(self.storage, [])
+        return writer.tobytes()
+
+
+# ---------------------------------------------------------------------------
+#  Часть 5. Минимальный писатель CFB (для извлечения вложенных .msg)
+# ---------------------------------------------------------------------------
+
+class CFBWriter:
+    """Запись простого compound file (v3, сектор 512) по [MS-CFB]."""
+
+    def __init__(self):
+        self.streams = {}    # tuple(path) -> bytes
+        self.storages = {}   # tuple(path) -> clsid
+        self.root_clsid = b"\x00" * 16
+
+    def add_storage(self, path, clsid=b"\x00" * 16):
+        self.storages[tuple(path)] = clsid or b"\x00" * 16
+
+    def add_stream(self, path, data):
+        self.streams[tuple(path)] = data
+        for i in range(1, len(path)):
+            self.storages.setdefault(tuple(path[:i]), b"\x00" * 16)
+
+    @staticmethod
+    def _name_key(name):
+        return (len(name), name.upper())
+
+    def tobytes(self):
+        SS, MS, CUT = 512, 64, 4096
+
+        # --- дерево записей каталога ---
+        entries = []   # [name, type, clsid, data|None, children:list]
+        root = ["Root Entry", OBJ_ROOT, self.root_clsid, None, []]
+        entries.append(root)
+        index_of = {(): 0}
+
+        def ensure(path):
+            if path in index_of:
+                return index_of[path]
+            parent = ensure(path[:-1])
+            clsid = self.storages.get(path, b"\x00" * 16)
+            node = [path[-1], OBJ_STORAGE, clsid, None, []]
+            entries.append(node)
+            idx = len(entries) - 1
+            index_of[path] = idx
+            entries[parent][4].append(idx)
+            return idx
+
+        for path in sorted(self.storages):
+            ensure(path)
+        for path, data in sorted(self.streams.items()):
+            parent = ensure(path[:-1])
+            node = [path[-1], OBJ_STREAM, b"\x00" * 16, data, []]
+            entries.append(node)
+            index_of[path] = len(entries) - 1
+            entries[parent][4].append(len(entries) - 1)
+
+        # --- данные: mini-stream и обычные секторы ---
+        big_payload = bytearray()
+        mini_payload = bytearray()
+        starts = {}          # индекс записи -> (start_sector, in_mini)
+        for i, node in enumerate(entries):
+            if node[1] != OBJ_STREAM:
+                continue
+            data = node[3]
+            if len(data) < CUT:
+                starts[i] = (len(mini_payload) // MS, True)
+                mini_payload += data
+                if len(mini_payload) % MS:
+                    mini_payload += b"\x00" * (MS - len(mini_payload) % MS)
+            else:
+                starts[i] = (len(big_payload) // SS, False)
+                big_payload += data
+                if len(big_payload) % SS:
+                    big_payload += b"\x00" * (SS - len(big_payload) % SS)
+
+        n_big = len(big_payload) // SS
+        mini_start_sector = n_big                       # mini-stream сразу после
+        n_mini_sectors = len(mini_payload) // SS + (1 if len(mini_payload) % SS else 0)
+        if len(mini_payload) % SS:
+            mini_payload += b"\x00" * (SS - len(mini_payload) % SS)
+
+        n_minifat_entries = len(mini_payload) // MS
+        n_minifat_sectors = (n_minifat_entries * 4 + SS - 1) // SS if n_minifat_entries else 0
+        minifat_start = n_big + n_mini_sectors
+
+        n_dir = (len(entries) * 128 + SS - 1) // SS
+        dir_start = minifat_start + n_minifat_sectors
+
+        # число FAT-секторов: решается итерацией (FAT описывает и сам себя)
+        payload = dir_start + n_dir
+        n_fat = 0
+        while True:
+            need = (payload + n_fat) * 4
+            new_n_fat = (need + SS - 1) // SS
+            if new_n_fat == n_fat:
+                break
+            n_fat = new_n_fat
+        fat_start = payload
+        total_sectors = payload + n_fat
+        if n_fat > 109:
+            raise CFBError("Файл слишком велик для упрощённого писателя CFB")
+
+        # --- FAT ---
+        fat = [FREESECT] * (n_fat * SS // 4)
+
+        def chain(start, count):
+            for k in range(count):
+                fat[start + k] = start + k + 1 if k < count - 1 else ENDOFCHAIN
+
+        pos = 0
+        for i, node in enumerate(entries):      # цепочки больших потоков
+            if node[1] == OBJ_STREAM and i in starts and not starts[i][1]:
+                cnt = (len(node[3]) + SS - 1) // SS
+                chain(starts[i][0], cnt)
+        if n_mini_sectors:
+            chain(mini_start_sector, n_mini_sectors)
+        if n_minifat_sectors:
+            chain(minifat_start, n_minifat_sectors)
+        chain(dir_start, n_dir)
+        for k in range(n_fat):
+            fat[fat_start + k] = FATSECT
+
+        # --- MiniFAT ---
+        minifat = [FREESECT] * (n_minifat_sectors * SS // 4)
+        for i, node in enumerate(entries):
+            if node[1] == OBJ_STREAM and i in starts and starts[i][1]:
+                start = starts[i][0]
+                cnt = (len(node[3]) + MS - 1) // MS
+                for k in range(cnt):
+                    minifat[start + k] = start + k + 1 if k < cnt - 1 else ENDOFCHAIN
+
+        # --- каталог ---
+        def build_dir():
+            blob = bytearray()
+            child_links = {}
+            for i, node in enumerate(entries):
+                kids = sorted(node[4], key=lambda j: self._name_key(entries[j][0]))
+                # вырожденное, но корректное двоичное дерево: цепочка right
+                for a, b in zip(kids, kids[1:]):
+                    child_links[a] = b
+                node.append(kids[0] if kids else NOSTREAM)  # node[5] = child
+
+            for i, node in enumerate(entries):
+                name, otype, clsid, data = node[0], node[1], node[2], node[3]
+                raw_name = name.encode("utf-16-le")[:62]
+                nlen = len(raw_name) + 2
+                if otype == OBJ_ROOT:
+                    start, size = (mini_start_sector if n_mini_sectors else ENDOFCHAIN,
+                                   len(mini_payload) if n_mini_sectors else 0)
+                elif otype == OBJ_STREAM:
+                    start, size = starts[i][0], len(data)
+                else:
+                    start, size = 0, 0
+                blob += struct.pack(
+                    "<64sHBBIII16sI8s8sIQ",
+                    raw_name + b"\x00" * (64 - len(raw_name)), nlen, otype,
+                    1,  # чёрный
+                    NOSTREAM, child_links.get(i, NOSTREAM), node[5],
+                    clsid, 0, b"\x00" * 8, b"\x00" * 8, start, size)
+            blob += b"\xff" * 0
+            while len(blob) % SS:
+                free = struct.pack("<64sHBBIII16sI8s8sIQ", b"\x00" * 64, 0, 0, 0,
+                                   NOSTREAM, NOSTREAM, NOSTREAM, b"\x00" * 16,
+                                   0, b"\x00" * 8, b"\x00" * 8, 0, 0)
+                blob += free
+            return bytes(blob)
+
+        dir_blob = build_dir()
+
+        # --- заголовок ---
+        difat = [FREESECT] * 109
+        for k in range(n_fat):
+            difat[k] = fat_start + k
+        header = struct.pack(
+            "<8s16sHHHHH6sIIIIIIIII109I",
+            CFB_SIGNATURE, b"\x00" * 16,
+            0x003E, 0x0003, 0xFFFE, 9, 6, b"\x00" * 6,
+            0,                       # число секторов каталога (v3 — 0)
+            n_fat, dir_start, 0, CUT,
+            minifat_start if n_minifat_sectors else ENDOFCHAIN,
+            n_minifat_sectors,
+            ENDOFCHAIN, 0,           # DIFAT целиком в заголовке
+            *difat)
+        assert len(header) == 512
+
+        body = bytearray()
+        body += big_payload
+        body += mini_payload
+        for v in minifat:
+            body += struct.pack("<I", v)
+        while len(body) % SS:
+            body += b"\x00"
+        body += dir_blob
+        for v in fat:
+            body += struct.pack("<I", v)
+        assert len(body) == total_sectors * SS
+        return bytes(header + body)
+
+
+# ---------------------------------------------------------------------------
+#  Часть 6. Графический интерфейс (tkinter)
+# ---------------------------------------------------------------------------
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, filedialog, messagebox
+    _TK_ERROR = None
+except ImportError as _exc:          # разбор msg возможен и без tkinter
+    _TK_ERROR = _exc
+
+    class _TkStub:                   # заглушки, чтобы объявление классов
+        Frame = object               # GUI не падало при импорте модуля
+        Tk = object
+    tk = ttk = _TkStub()
+    filedialog = messagebox = None
+
+
+def human_size(n):
+    if n < 1024:
+        return "%d Б" % n
+    for unit in ("КБ", "МБ", "ГБ"):
+        n /= 1024.0
+        if n < 1024:
+            return "%.1f %s" % (n, unit)
+    return "%.1f ТБ" % n
+
+
+def sanitize_filename(name):
+    name = re.sub(r'[\\/:*?"<>|\x00-\x1f]', "_", name).strip(" .")
+    return name[:200] or "attachment"
+
+
+class _HTMLToWidget(html.parser.HTMLParser):
+    """Упрощённый рендер HTML в tkinter.Text: абзацы, заголовки, списки,
+    жирный/курсив/подчёркнутый текст, ссылки. Стили и таблицы не строятся,
+    но их текстовое содержимое сохраняется."""
+
+    _SKIP = {"script", "style", "title", "head", "xml"}
+    _BOLD = {"b", "strong", "th"}
+    _ITALIC = {"i", "em"}
+    _UNDER = {"u", "ins"}
+    _HEAD = {"h1", "h2", "h3", "h4", "h5", "h6"}
+    _BLOCK = {"p", "div", "tr", "table", "ul", "ol", "blockquote", "pre"}
+
+    def __init__(self, widget):
+        super().__init__(convert_charrefs=True)
+        self.w = widget
+        self._skip = 0
+        self._styles = []          # активные форматные теги
+        self._href = None
+        self._link_id = 0
+        self._pending_nl = 0       # число ожидающих переводов строки
+        self._wrote = False
+        widget.tag_configure("b", font=("", 10, "bold"))
+        widget.tag_configure("i", font=("", 10, "italic"))
+        widget.tag_configure("u", underline=True)
+        for i, sz in enumerate((15, 13, 12, 11, 11, 10), start=1):
+            widget.tag_configure("h%d" % i, font=("", sz, "bold"))
+        widget.tag_configure("a", foreground="#0563C1", underline=True)
+        widget.tag_configure("pre", font=("Monospace", 10))
+
+    def _newline(self, count=1):
+        self._pending_nl = max(self._pending_nl, count)
+
+    def handle_starttag(self, tag, attrs):
+        if tag in self._SKIP:
+            self._skip += 1
+        elif tag == "br":
+            self._newline(1)
+        elif tag in self._HEAD:
+            self._newline(2)
+            self._styles.append(tag)
+        elif tag == "li":
+            self._newline(1)
+            self._emit("• ")
+        elif tag in self._BLOCK:
+            self._newline(2 if tag in ("p", "table", "ul", "ol") else 1)
+            if tag == "pre":
+                self._styles.append("pre")
+        elif tag in self._BOLD:
+            self._styles.append("b")
+        elif tag in self._ITALIC:
+            self._styles.append("i")
+        elif tag in self._UNDER:
+            self._styles.append("u")
+        elif tag == "a":
+            for k, v in attrs:
+                if k == "href":
+                    self._href = v
+            self._styles.append("a")
+        elif tag == "td":
+            self._emit("\t")
+
+    def handle_endtag(self, tag):
+        if tag in self._SKIP and self._skip:
+            self._skip -= 1
+            return
+        if tag in self._HEAD:
+            self._pop(tag)
+            self._newline(2)
+        elif tag == "pre":
+            self._pop("pre")
+            self._newline(2)
+        elif tag in ("p", "div", "tr", "table", "ul", "ol", "blockquote"):
+            self._newline(2 if tag in ("p", "table", "ul", "ol") else 1)
+        elif tag in self._BOLD:
+            self._pop("b")
+        elif tag in self._ITALIC:
+            self._pop("i")
+        elif tag in self._UNDER:
+            self._pop("u")
+        elif tag == "a":
+            self._pop("a")
+            if self._href:
+                self._emit(" (%s)" % self._href, extra=())
+            self._href = None
+
+    def _pop(self, tag):
+        if tag in self._styles:
+            # снять последнее вхождение
+            for i in range(len(self._styles) - 1, -1, -1):
+                if self._styles[i] == tag:
+                    del self._styles[i]
+                    break
+
+    def handle_data(self, data):
+        if self._skip:
+            return
+        text = re.sub(r"\s+", " ", data)
+        if not text or text == " ":
+            if text == " " and self._wrote and not self._pending_nl:
+                self._emit(" ")
+            return
+        self._emit(text)
+
+    def _emit(self, text, extra=None):
+        if self._pending_nl and self._wrote:
+            self.w.insert("end", "\n" * self._pending_nl)
+        self._pending_nl = 0
+        tags = tuple(self._styles) if extra is None else extra
+        self.w.insert("end", text, tags)
+        self._wrote = True
+
+
+def render_html_to_text_widget(widget, markup):
+    parser = _HTMLToWidget(widget)
+    try:
+        parser.feed(markup)
+        parser.close()
+    except Exception:
+        # при любой ошибке разметки — показать хотя бы извлечённый текст
+        widget.insert("end", html_to_text(markup))
+
+
+class MessageFrame(ttk.Frame):
+    """Панель просмотра одного сообщения (используется и для вложенных)."""
+
+    def __init__(self, master, message, source_name=""):
+        super().__init__(master, padding=0)
+        self.message = message
+        self.source_name = source_name
+        self._build()
+
+    # -- интерфейс ---------------------------------------------------------
+
+    def _build(self):
+        msg = self.message
+
+        header = ttk.Frame(self, padding=(12, 10, 12, 6))
+        header.pack(fill="x")
+        header.columnconfigure(1, weight=1)
+
+        subject = msg.subject or "(без темы)"
+        lbl_subject = ttk.Label(header, text=subject, font=("", 12, "bold"),
+                                wraplength=760, justify="left")
+        lbl_subject.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 6))
+
+        rows = [("От:", msg.sender_display())]
+        to = msg.display_to()
+        cc = msg.display_cc()
+        if to:
+            rows.append(("Кому:", to))
+        if cc:
+            rows.append(("Копия:", cc))
+        bcc = "; ".join(msg.recipients["bcc"])
+        if bcc:
+            rows.append(("Скрытая:", bcc))
+        if msg.date:
+            local = msg.date.astimezone()
+            rows.append(("Дата:", local.strftime("%d.%m.%Y %H:%M:%S %Z")))
+
+        for r, (title, value) in enumerate(rows, start=1):
+            ttk.Label(header, text=title, foreground="#555").grid(
+                row=r, column=0, sticky="nw", padx=(0, 8))
+            ttk.Label(header, text=value or "—", wraplength=720,
+                      justify="left").grid(row=r, column=1, sticky="w")
+
+        # --- переключатель режима отображения (всегда виден) ---
+        toolbar = ttk.Frame(self, padding=(12, 4, 12, 4))
+        toolbar.pack(fill="x")
+        ttk.Label(toolbar, text="Вид:").pack(side="left", padx=(0, 6))
+        self.view_mode = tk.StringVar(value="html" if msg.body_html else "text")
+        rb_html = ttk.Radiobutton(toolbar, text="HTML", value="html",
+                                  variable=self.view_mode,
+                                  command=self._render_body)
+        rb_text = ttk.Radiobutton(toolbar, text="Текст", value="text",
+                                  variable=self.view_mode,
+                                  command=self._render_body)
+        rb_html.pack(side="left")
+        rb_text.pack(side="left", padx=(6, 0))
+        if not msg.body_html:
+            rb_html.state(["disabled"])   # HTML-версии нет — только текст
+
+        ttk.Separator(self, orient="horizontal").pack(fill="x")
+
+        # --- основная область: тело слева, вложения справа ---
+        visible = list(msg.attachments)
+        paned = ttk.Panedwindow(self, orient="horizontal")
+        paned.pack(fill="both", expand=True)
+
+        body_frame = ttk.Frame(paned)
+        self.text = tk.Text(body_frame, wrap="word", padx=12, pady=8,
+                            font=("", 10), relief="flat",
+                            background="white", foreground="#1a1a1a")
+        vsb = ttk.Scrollbar(body_frame, orient="vertical",
+                            command=self.text.yview)
+        self.text.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.text.pack(side="left", fill="both", expand=True)
+        paned.add(body_frame, weight=3)
+
+        if visible:
+            paned.add(self._build_attachments_panel(paned, visible), weight=1)
+
+        self._render_body()
+
+    # -- панель вложений (справа) -----------------------------------------
+
+    def _build_attachments_panel(self, master, visible):
+        att_frame = ttk.Frame(master, padding=(8, 6, 8, 8))
+        ttk.Label(att_frame, text="Вложения (%d)" % len(visible),
+                  font=("", 10, "bold")).pack(anchor="w")
+
+        tree_wrap = ttk.Frame(att_frame)
+        tree_wrap.pack(fill="both", expand=True, pady=(6, 6))
+        self.tree = ttk.Treeview(tree_wrap, columns=("size",),
+                                 selectmode="extended", show="tree headings")
+        self.tree.heading("#0", text="Имя файла", anchor="w")
+        self.tree.heading("size", text="Размер", anchor="w")
+        self.tree.column("#0", width=220, stretch=True)
+        self.tree.column("size", width=80, stretch=False, anchor="e")
+        tvsb = ttk.Scrollbar(tree_wrap, orient="vertical",
+                             command=self.tree.yview)
+        self.tree.configure(yscrollcommand=tvsb.set)
+        tvsb.pack(side="right", fill="y")
+        self.tree.pack(side="left", fill="both", expand=True)
+
+        for a in visible:
+            if a.embedded_message is not None:
+                suffix = "  (письмо)"
+            elif a.hidden or a.content_id:
+                suffix = "  (встроено)"
+            else:
+                suffix = ""
+            self.tree.insert("", "end", iid=str(a.index),
+                             text=" " + a.name + suffix,
+                             values=(human_size(a.size),))
+        self.tree.bind("<Double-1>", self._on_double_click)
+
+        btns = ttk.Frame(att_frame)
+        btns.pack(fill="x")
+        ttk.Button(btns, text="Сохранить выбранное…",
+                   command=self.save_selected).pack(fill="x")
+        ttk.Button(btns, text="Сохранить все…",
+                   command=self.save_all).pack(fill="x", pady=(4, 0))
+        return att_frame
+
+    # -- отрисовка тела письма --------------------------------------------
+
+    def _render_body(self):
+        msg = self.message
+        mode = self.view_mode.get()
+        self.text.configure(state="normal")
+        self.text.delete("1.0", "end")
+        for tag in self.text.tag_names():
+            self.text.tag_delete(tag)
+        if mode == "html" and msg.body_html:
+            render_html_to_text_widget(self.text, msg.body_html)
+        else:
+            self.text.insert("1.0", msg.body_text or "(письмо не содержит текста)")
+        self.text.configure(state="disabled")
+
+    # -- работа с вложениями ----------------------------------------------
+
+    def _selected(self):
+        if not hasattr(self, "tree"):
+            return []
+        ids = self.tree.selection()
+        att = {a.index: a for a in self.message.attachments}
+        return [att[int(i)] for i in ids if int(i) in att]
+
+    def save_selected(self):
+        sel = self._selected()
+        if not sel:
+            messagebox.showinfo("Вложения",
+                                "Выберите вложение в списке.", parent=self)
+            return
+        if len(sel) == 1:
+            self._save_one(sel[0])
+        else:
+            self._save_many(sel)
+
+    def save_all(self):
+        att = [a for a in self.message.attachments if a.savable]
+        if not att:
+            messagebox.showinfo("Вложения", "Нет вложений для сохранения.",
+                                parent=self)
+            return
+        self._save_many(att)
+
+    def _save_one(self, a):
+        if not a.savable:
+            messagebox.showwarning(
+                "Вложения", "Это вложение имеет нестандартный тип (OLE) "
+                "и не может быть сохранено.", parent=self)
+            return
+        fname = sanitize_filename(a.name)
+        path = filedialog.asksaveasfilename(
+            parent=self, title="Сохранить вложение",
+            initialfile=fname)
+        if not path:
+            return
+        try:
+            a.save(path)
+        except OSError as exc:
+            messagebox.showerror("Ошибка сохранения", str(exc), parent=self)
+            return
+        messagebox.showinfo("Вложения", "Сохранено:\n%s" % path, parent=self)
+
+    def _save_many(self, attachments):
+        directory = filedialog.askdirectory(
+            parent=self, title="Каталог для сохранения вложений")
+        if not directory:
+            return
+        saved, errors = 0, []
+        used = set()
+        for a in attachments:
+            if not a.savable:
+                errors.append("%s — нестандартный тип, пропущено" % a.name)
+                continue
+            fname = sanitize_filename(a.name)
+            base, ext = os.path.splitext(fname)
+            k = 1
+            while fname.lower() in used or os.path.exists(os.path.join(directory, fname)):
+                fname = "%s (%d)%s" % (base, k, ext)
+                k += 1
+            used.add(fname.lower())
+            try:
+                a.save(os.path.join(directory, fname))
+                saved += 1
+            except OSError as exc:
+                errors.append("%s — %s" % (a.name, exc))
+        text = "Сохранено файлов: %d из %d\nКаталог: %s" % (
+            saved, len(attachments), directory)
+        if errors:
+            text += "\n\nОшибки:\n" + "\n".join(errors)
+            messagebox.showwarning("Вложения", text, parent=self)
+        else:
+            messagebox.showinfo("Вложения", text, parent=self)
+
+    def _on_double_click(self, _event):
+        sel = self._selected()
+        if len(sel) != 1:
+            return
+        a = sel[0]
+        if a.embedded_message is not None:
+            win = tk.Toplevel(self)
+            win.title("%s — вложенное письмо" % (a.embedded_message.subject
+                                                 or a.name))
+            win.geometry("760x560")
+            MessageFrame(win, a.embedded_message).pack(fill="both", expand=True)
+        else:
+            self._save_one(a)
+
+
+class MsgViewerApp(tk.Tk):
+    def __init__(self, path=None):
+        super().__init__()
+        self.title("Просмотр MSG")
+        self.geometry("860x640")
+        self.minsize(520, 360)
+
+        try:
+            style = ttk.Style(self)
+            if "clam" in style.theme_names():
+                style.theme_use("clam")
+        except tk.TclError:
+            pass
+
+        self._build_menu()
+        self.container = ttk.Frame(self)
+        self.container.pack(fill="both", expand=True)
+        self.current = None
+
+        if path:
+            self.open_file(path)
+        else:
+            self._show_placeholder()
+
+    def _build_menu(self):
+        menubar = tk.Menu(self)
+        m_file = tk.Menu(menubar, tearoff=0)
+        m_file.add_command(label="Открыть…", accelerator="Ctrl+O",
+                           command=self.open_dialog)
+        m_file.add_separator()
+        m_file.add_command(label="Выход", accelerator="Ctrl+Q",
+                           command=self.destroy)
+        menubar.add_cascade(label="Файл", menu=m_file)
+
+        m_help = tk.Menu(menubar, tearoff=0)
+        m_help.add_command(label="О программе", command=self._about)
+        menubar.add_cascade(label="Справка", menu=m_help)
+        self.config(menu=menubar)
+        self.bind("<Control-o>", lambda e: self.open_dialog())
+        self.bind("<Control-q>", lambda e: self.destroy())
+
+    def _about(self):
+        messagebox.showinfo(
+            "О программе",
+            "Просмотр файлов Microsoft Outlook (.msg)\n\n"
+            "Собственный разбор форматов по спецификациям\n"
+            "[MS-CFB], [MS-OXMSG], [MS-OXPROPS].\n"
+            "Python 3 + tkinter, без внешних зависимостей.",
+            parent=self)
+
+    def _show_placeholder(self):
+        self._clear()
+        frame = ttk.Frame(self.container)
+        frame.pack(fill="both", expand=True)
+        inner = ttk.Frame(frame)
+        inner.place(relx=0.5, rely=0.45, anchor="center")
+        ttk.Label(inner, text="Файл не открыт",
+                  font=("", 13)).pack(pady=(0, 10))
+        ttk.Button(inner, text="Открыть msg-файл…",
+                   command=self.open_dialog).pack()
+
+    def _clear(self):
+        for w in self.container.winfo_children():
+            w.destroy()
+
+    def open_dialog(self):
+        path = filedialog.askopenfilename(
+            parent=self, title="Открыть письмо Outlook",
+            filetypes=[("Письма Outlook (*.msg)", "*.msg"),
+                       ("Все файлы", "*.*")])
+        if path:
+            self.open_file(path)
+
+    def open_file(self, path):
+        try:
+            with open(path, "rb") as fh:
+                data = fh.read()
+            cfb = CompoundFile(data)
+            message = Message(cfb)
+        except (OSError, CFBError, struct.error) as exc:
+            messagebox.showerror(
+                "Ошибка открытия",
+                "Не удалось открыть файл:\n%s\n\n%s" % (path, exc),
+                parent=self)
+            if self.current is None:
+                self._show_placeholder()
+            return
+        self._clear()
+        self.current = MessageFrame(self.container, message,
+                                    source_name=os.path.basename(path))
+        self.current.pack(fill="both", expand=True)
+        self.title("%s — Просмотр MSG" % os.path.basename(path))
+
+
+# ---------------------------------------------------------------------------
+#  Часть 7. Конвертация из командной строки (без GUI)
+# ---------------------------------------------------------------------------
+
+def _html_escape(text):
+    return (text.replace("&", "&amp;").replace("<", "&lt;")
+                .replace(">", "&gt;"))
+
+
+def message_to_html(message):
+    """Полноценный HTML-документ письма: шапка + тело.
+
+    Использует оригинальный HTML тела (PidTagHtml / де-инкапсулированный из
+    RTF), если он есть; иначе оборачивает plain-text в <pre>.
+    """
+    rows = [("От", message.sender_display())]
+    to, cc = message.display_to(), message.display_cc()
+    if to:
+        rows.append(("Кому", to))
+    if cc:
+        rows.append(("Копия", cc))
+    bcc = "; ".join(message.recipients["bcc"])
+    if bcc:
+        rows.append(("Скрытая", bcc))
+    if message.date:
+        rows.append(("Дата",
+                     message.date.astimezone().strftime("%d.%m.%Y %H:%M:%S %Z")))
+    header_rows = "\n".join(
+        "<tr><td class=\"k\">%s:</td><td>%s</td></tr>"
+        % (_html_escape(k), _html_escape(v or "—")) for k, v in rows)
+
+    if message.body_html:
+        body = message.body_html
+        # если это цельный документ — вставляем шапку в начало <body>
+        m = re.search(r"(<body\b[^>]*>)", body, re.I)
+        header_block = (
+            "<div style=\"font-family:sans-serif;font-size:13px;"
+            "border-bottom:1px solid #ccc;margin-bottom:12px;padding-bottom:8px\">"
+            "<h2 style=\"margin:0 0 8px\">%s</h2><table>%s</table></div>"
+            % (_html_escape(message.subject or "(без темы)"), header_rows))
+        if m:
+            return body[:m.end()] + header_block + body[m.end():]
+        return header_block + body
+
+    # только текст — собираем документ сами
+    return (
+        "<!DOCTYPE html>\n<html><head><meta charset=\"utf-8\">"
+        "<title>%s</title></head><body style=\"font-family:sans-serif\">"
+        "<h2>%s</h2><table>%s</table><hr>"
+        "<pre style=\"white-space:pre-wrap;font-family:inherit\">%s</pre>"
+        "</body></html>"
+        % (_html_escape(message.subject or "(без темы)"),
+           _html_escape(message.subject or "(без темы)"),
+           header_rows, _html_escape(message.body_text or "")))
+
+
+def message_to_text(message):
+    """Полное текстовое представление письма: шапка + тело."""
+    lines = ["Тема: " + (message.subject or "(без темы)"),
+             "От: " + (message.sender_display() or "—")]
+    to, cc = message.display_to(), message.display_cc()
+    if to:
+        lines.append("Кому: " + to)
+    if cc:
+        lines.append("Копия: " + cc)
+    bcc = "; ".join(message.recipients["bcc"])
+    if bcc:
+        lines.append("Скрытая: " + bcc)
+    if message.date:
+        lines.append("Дата: " + message.date.astimezone()
+                     .strftime("%d.%m.%Y %H:%M:%S %Z"))
+    lines.append("")
+    lines.append("-" * 60)
+    lines.append("")
+    lines.append(message.body_text or "(письмо не содержит текста)")
+    return "\n".join(lines)
+
+
+def _unique_path(directory, filename):
+    base, ext = os.path.splitext(filename)
+    candidate, k = filename, 1
+    while os.path.exists(os.path.join(directory, candidate)):
+        candidate = "%s (%d)%s" % (base, k, ext)
+        k += 1
+    return os.path.join(directory, candidate)
+
+
+def convert_file(path, mode, outdir):
+    """Сохраняет тело письма (txt|html) и все вложения в каталог outdir.
+
+    Возвращает список путей сохранённых файлов. GUI не задействуется.
+    """
+    with open(path, "rb") as fh:
+        data = fh.read()
+    message = Message(CompoundFile(data))
+
+    os.makedirs(outdir, exist_ok=True)
+    stem = sanitize_filename(os.path.splitext(os.path.basename(path))[0]) or "message"
+    saved = []
+
+    # 1) тело письма
+    if mode == "html":
+        body_path = _unique_path(outdir, stem + ".html")
+        content = message_to_html(message).encode("utf-8", "replace")
+    else:
+        body_path = _unique_path(outdir, stem + ".txt")
+        content = message_to_text(message).encode("utf-8", "replace")
+    with open(body_path, "wb") as fh:
+        fh.write(content)
+    saved.append(body_path)
+
+    # 2) вложения в исходном формате
+    for a in message.attachments:
+        if not a.savable:
+            print("  пропущено (нестандартный тип): %s" % a.name,
+                  file=sys.stderr)
+            continue
+        att_path = _unique_path(outdir, sanitize_filename(a.name))
+        try:
+            a.save(att_path)
+            saved.append(att_path)
+        except OSError as exc:
+            print("  ошибка сохранения %s: %s" % (a.name, exc), file=sys.stderr)
+    return saved
+
+
+# ---------------------------------------------------------------------------
+#  Точка входа
+# ---------------------------------------------------------------------------
+
+USAGE = """\
+Просмотр и конвертация писем Microsoft Outlook (.msg)
+
+Использование:
+  msg_newviewer [файл.msg]
+        Открыть графический интерфейс (файл необязателен).
+
+  msg_newviewer --convert --mode=txt|html --outdir=КАТАЛОГ файл.msg [...]
+        Без графического интерфейса сохранить в КАТАЛОГ текст письма
+        (в формате txt или html) и все вложения в исходном формате.
+
+Параметры конвертации:
+  --convert            режим конвертации (GUI не открывается)
+  --mode=txt|html      формат сохранения тела письма (по умолчанию txt)
+  --outdir=КАТАЛОГ     каталог назначения (по умолчанию текущий)
+  -h, --help           эта справка
+"""
+
+
+def run_convert(files, mode, outdir):
+    if mode not in ("txt", "html"):
+        print("Неверный режим: %s (ожидается txt или html)" % mode,
+              file=sys.stderr)
+        return 2
+    if not files:
+        print("Не указан ни один .msg файл для конвертации.", file=sys.stderr)
+        return 2
+    rc = 0
+    for path in files:
+        if not os.path.isfile(path):
+            print("Файл не найден: %s" % path, file=sys.stderr)
+            rc = 1
+            continue
+        try:
+            saved = convert_file(path, mode, outdir)
+        except (CFBError, struct.error, OSError) as exc:
+            print("Ошибка обработки %s: %s" % (path, exc), file=sys.stderr)
+            rc = 1
+            continue
+        print("%s -> %s (%d файл(ов))"
+              % (os.path.basename(path), outdir, len(saved)))
+        for p in saved:
+            print("    " + os.path.basename(p))
+    return rc
+
+
+def main(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    if "-h" in argv or "--help" in argv:
+        print(USAGE)
+        return 0
+
+    convert = False
+    mode = "txt"
+    outdir = "."
+    files = []
+    for arg in argv:
+        if arg == "--convert":
+            convert = True
+        elif arg.startswith("--mode="):
+            mode = arg.split("=", 1)[1].strip().lower()
+        elif arg.startswith("--outdir="):
+            outdir = arg.split("=", 1)[1]
+        elif arg == "--mode" or arg == "--outdir":
+            print("Параметр %s требует значения через '=' "
+                  "(например, %s=html)" % (arg, arg), file=sys.stderr)
+            return 2
+        elif arg.startswith("--"):
+            print("Неизвестный параметр: %s" % arg, file=sys.stderr)
+            return 2
+        else:
+            files.append(arg)
+
+    if convert:
+        return run_convert(files, mode, outdir)
+
+    # без параметров конвертации — графический интерфейс
+    if _TK_ERROR is not None:
+        print("Не найден tkinter (%s).\n"
+              "Установите пакет: sudo apt install python3-tk\n"
+              "Либо используйте режим конвертации: --convert --mode=... "
+              "--outdir=... файл.msg" % _TK_ERROR, file=sys.stderr)
+        return 2
+    path = files[0] if files else None
+    if path and not os.path.isfile(path):
+        print("Файл не найден: %s" % path, file=sys.stderr)
+        return 1
+    app = MsgViewerApp(path)
+    app.mainloop()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
