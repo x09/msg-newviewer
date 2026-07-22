@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mime-info xmlns="http://www.freedesktop.org/standards/shared-mime-info">
+  <mime-type type="application/vnd.ms-outlook">
+    <comment>Outlook mail message</comment>
+    <comment xml:lang="ru">Письмо Outlook</comment>
+    <glob pattern="*.msg"/>
+    <glob pattern="*.MSG"/>
+  </mime-type>
+</mime-info>
