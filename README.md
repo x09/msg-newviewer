@@ -11,7 +11,7 @@
 командной строки.
 
 
-<img width="1046" height="817" alt="изображение" src="https://github.com/user-attachments/assets/ae957367-c4ef-4dcf-b43e-ce18b12f2da8" />
+<img width="1225" height="754" alt="изображение" src="https://github.com/user-attachments/assets/1bb413f8-b97d-42dc-a047-1a814e2a8976" />
 
 
 ## Возможности
