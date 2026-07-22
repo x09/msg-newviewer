@@ -48,9 +48,14 @@
 ### Из RPM-пакета (ALT Linux)
 
 ```bash
-rpmbuild -ba msg-newviewer.spec
-sudo rpm -i msg-newviewer-1.0-alt1.noarch.rpm
+rpm -i msg-newviewer-1.0-alt1.noarch.rpm
 ```
+или , если установлен репозиторий altrepo.ru, штатным способом
+
+```bash
+apt-get install msg-newviewer
+```
+
 
 При установке пакет регистрирует MIME-тип `application/vnd.ms-outlook`,
 устанавливает `.desktop`-файл и иконки, а также прописывает приложение
