@@ -10,7 +10,7 @@
 умеет сохранять вложения на диск и конвертировать письма в `txt`/`html` из
 командной строки.
 
-<img width="1062" height="648" alt="изображение" src="https://github.com/user-attachments/assets/7bc28a09-a35c-4723-bd70-d9144846b68f" />
+<img width="1060" height="705" alt="изображение" src="https://github.com/user-attachments/assets/8392e5d9-c49c-47c8-bd02-9757b5a7bcd6" />
 
 
 ## Возможности
