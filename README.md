@@ -52,9 +52,9 @@
 ### Из RPM-пакета (ALT Linux)
 
 ```bash
-rpm -i msg-newviewer-1.0-alt1.noarch.rpm
+rpm -i msg-newviewer-2.0-alt1.noarch.rpm
 ```
-или , если установлен репозиторий altrepo.ru, штатным способом
+или , если установлен репозиторий http://altrepo.ru, штатным способом
 
 ```bash
 apt-get install msg-newviewer
