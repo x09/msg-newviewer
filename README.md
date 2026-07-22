@@ -1,7 +1,7 @@
 # MSG NewViewer
 
 Лёгкий просмотрщик сохранённых файлов электронной почты Microsoft Outlook
-(`.msg`) для Linux. Не требует установленного Microsoft Outlook и вообще
+(`.msg`) для GNU\Linux. Не требует установленного Microsoft Outlook и вообще
 никаких проприетарных или сторонних зависимостей — только Python 3, tkinter
 и Pillow из стандартной поставки.
 
@@ -43,8 +43,8 @@
 ## Требования
 
 - Python 3.6 или новее.
-- Tkinter (пакет `python3-modules-tkinter` в ALT Linux,
-  `python3-tk` в Debian/Ubuntu) — нужен только для графического режима.
+- Tkinter, Pillow (пакеты `python3-modules-tkinter`,`python3-modules-Pillow` в ALT Linux,
+  `python3-tk`, `python3-pil` в Debian/Ubuntu) — нужен только для графического режима.
   Режим `--convert` работает и без Tkinter.
 
 ## Установка
