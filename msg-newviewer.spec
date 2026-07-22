@@ -1,5 +1,5 @@
 Name:          msg-newviewer
-Version:       1.0
+Version:       2.0
 Release:       alt1
 License:       %lgpl3plus
 Group:         System/Configuration/Other
@@ -13,6 +13,8 @@ BuildRequires: rpm-build-licenses
 Requires: python3-modules-tkinter
 Requires: altlinux-mime-defaults
 Requires: shared-mime-info
+Requires: python3-module-Pillow
+Requires: xdg-utils
 
 %description -l ru_RU.UTF-8
 MSG NewViewer — лёгкий просмотрщик сохраненных файлов электронной почты
@@ -112,5 +114,11 @@ update-desktop-database %_desktopdir ||:
 %_xdgmimedir/packages/application-vnd.ms-outlook.xml
 
 %changelog
+* Wed Jul 22 2026 Anton Shevtsov <shevtsov.anton@gmail.com> 2.0-alt1
+- Show first 5 recipients explicitly, collapse the rest under "(N more recipients)" link
+- Render inline images (jpg/png/gif) directly within the message body
+- Add PIL/Pillow support for JPEG decoding and scaling of oversized images
+- Double-click an attachment to open it via xdg-open (saved to a temp dir)
+
 * Wed Jul 22 2026 Anton Shevtsov <shevtsov.anton@gmail.com> 1.0-alt1
 - First version
