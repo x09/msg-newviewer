@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=MSG NewViewer
+Name[ru]=Просмотр MSG
+Comment=View Outlook .msg email files
+Exec=/usr/bin/msg-newviewer %f
+Icon=msg-newviewer
+Terminal=false
+Categories=Office;Email;Utility;
+MimeType=application/vnd.ms-outlook;
+StartupNotify=true
